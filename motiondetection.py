@@ -1,16 +1,14 @@
 from flask import Flask, Response, render_template_string, request, jsonify
-import cv2
 import numpy as np
 import threading
 import base64
 import io
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import os
 
 app = Flask(__name__)
 
 # Variables globales
-fgbg = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40)
 counter = 0
 frame_width = 640
 frame_height = 480
@@ -18,50 +16,85 @@ line_position = frame_width // 2
 tracking_object = None
 latest_frame = None
 frame_lock = threading.Lock()
+background_frames = []
+background_model = None
+
+def create_background_model(frames):
+    """Crée un modèle d'arrière-plan simple"""
+    if len(frames) < 5:
+        return None
+    
+    # Convertir en arrays numpy
+    arrays = [np.array(frame) for frame in frames]
+    
+    # Calculer la médiane pour chaque pixel
+    background = np.median(arrays, axis=0).astype(np.uint8)
+    return Image.fromarray(background)
+
+def detect_motion(current_frame, background):
+    """Détecte le mouvement en comparant avec l'arrière-plan"""
+    if background is None:
+        return None, None
+    
+    # Convertir en arrays numpy
+    current_array = np.array(current_frame.convert('L'))  # Convertir en niveaux de gris
+    background_array = np.array(background.convert('L'))
+    
+    # Calculer la différence
+    diff = np.abs(current_array.astype(np.int16) - background_array.astype(np.int16))
+    
+    # Seuillage
+    threshold = 30
+    motion_mask = diff > threshold
+    
+    # Trouver le centre de masse du mouvement
+    if np.sum(motion_mask) > 500:  # Seuil minimum de pixels en mouvement
+        y_coords, x_coords = np.where(motion_mask)
+        if len(x_coords) > 0:
+            center_x = int(np.mean(x_coords))
+            center_y = int(np.mean(y_coords))
+            area = np.sum(motion_mask)
+            return (center_x, center_y), area
+    
+    return None, None
 
 def process_frame_data(frame_data):
     """Traite les données d'image reçues du client"""
-    global counter, tracking_object, latest_frame, fgbg
+    global counter, tracking_object, latest_frame, background_frames, background_model
     
     try:
         # Décoder l'image base64
         image_data = base64.b64decode(frame_data.split(',')[1])
         image = Image.open(io.BytesIO(image_data))
-        frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        frame = image.resize((frame_width, frame_height))
         
-        # Redimensionner l'image
-        frame = cv2.resize(frame, (frame_width, frame_height))
+        # Mettre à jour le modèle d'arrière-plan
+        background_frames.append(frame.copy())
+        if len(background_frames) > 10:
+            background_frames.pop(0)
+        
+        if len(background_frames) >= 5 and background_model is None:
+            background_model = create_background_model(background_frames)
+        elif len(background_frames) >= 10:
+            # Mettre à jour occasionnellement le modèle d'arrière-plan
+            if len(background_frames) % 5 == 0:
+                background_model = create_background_model(background_frames[-5:])
+        
+        # Créer une copie pour dessiner
+        draw_frame = frame.copy()
+        draw = ImageDraw.Draw(draw_frame)
         
         # Dessiner la ligne de comptage
-        cv2.line(frame, (line_position, 0), (line_position, frame_height), (255, 0, 0), 3)
+        draw.line([(line_position, 0), (line_position, frame_height)], fill=(255, 0, 0), width=3)
         
-        # Appliquer la soustraction d'arrière-plan
-        fgmask = fgbg.apply(frame)
+        # Détecter le mouvement
+        motion_center, motion_area = detect_motion(frame, background_model)
         
-        # Supprimer le bruit
-        kernel = np.ones((5, 5), np.uint8)
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel)
-        
-        # Trouver les contours
-        contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        biggest_area = 0
-        biggest_center = None
-        
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > 1000:  # Seuil adapté pour les images plus petites
-                if area > biggest_area:
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    cx = x + w // 2
-                    cy = y + h // 2
-                    biggest_area = area
-                    biggest_center = (cx, cy)
-        
-        if biggest_center is not None:
-            cx, cy = biggest_center
-            cv2.circle(frame, (cx, cy), 10, (0, 0, 255), -1)
+        if motion_center is not None and motion_area > 1000:
+            cx, cy = motion_center
+            
+            # Dessiner le centre du mouvement
+            draw.ellipse([cx-10, cy-10, cx+10, cy+10], fill=(0, 0, 255))
             
             if tracking_object is not None:
                 prev_cx, prev_cy = tracking_object
@@ -81,12 +114,16 @@ def process_frame_data(frame_data):
             tracking_object = None
         
         # Ajouter le texte du compteur
-        cv2.putText(frame, f"Counter: {counter}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        try:
+            font = ImageFont.load_default()
+            draw.text((20, 20), f"Counter: {counter}", fill=(0, 0, 255), font=font)
+        except:
+            draw.text((20, 20), f"Counter: {counter}", fill=(0, 0, 255))
         
         # Encoder l'image traitée
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+        img_buffer = io.BytesIO()
+        draw_frame.save(img_buffer, format='JPEG', quality=80)
+        frame_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
         
         with frame_lock:
             latest_frame = frame_base64
@@ -102,7 +139,7 @@ def index():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Motion Detection - Camera Stream</title>
+    <title>Motion Detection - Simple Version</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body {
@@ -177,7 +214,7 @@ def index():
 </head>
 <body>
     <div class="container">
-        <h1>Détection de Mouvement</h1>
+        <h1>Détection de Mouvement - Version Simple</h1>
         
         <div class="counter">
             Compteur: <span id="counterValue">0</span>
@@ -232,7 +269,6 @@ def index():
                 
                 showStatus('Caméra démarrée avec succès', 'success');
                 
-                // Commencer le traitement des images
                 startProcessing();
                 
             } catch (err) {
@@ -263,7 +299,7 @@ def index():
             
             intervalId = setInterval(() => {
                 captureAndProcess();
-            }, 200); // Traiter 5 images par seconde
+            }, 300);
         }
 
         function stopProcessing() {
@@ -285,9 +321,8 @@ def index():
             
             ctx.drawImage(localVideo, 0, 0, canvas.width, canvas.height);
             
-            const imageData = canvas.toDataURL('image/jpeg', 0.8);
+            const imageData = canvas.toDataURL('image/jpeg', 0.7);
             
-            // Envoyer l'image au serveur pour traitement
             fetch('/process_frame', {
                 method: 'POST',
                 headers: {
@@ -319,7 +354,6 @@ def index():
             });
         }
 
-        // Arrêter la caméra lors de la fermeture de la page
         window.addEventListener('beforeunload', stopCamera);
     </script>
 </body>
@@ -354,8 +388,10 @@ def process_frame():
 
 @app.route('/reset_counter', methods=['POST'])
 def reset_counter():
-    global counter
+    global counter, background_model, background_frames
     counter = 0
+    background_model = None
+    background_frames = []
     return jsonify({'success': True, 'counter': counter})
 
 @app.route('/get_counter')

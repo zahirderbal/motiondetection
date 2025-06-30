@@ -1,18 +1,9 @@
 services:
   - type: web
     name: motion-detection
-    env: python
-    region: frankfurt
-    plan: free
-    buildCommand: |
-      pip install --upgrade pip setuptools wheel
-      pip install -r requirements.txt
+    runtime: python
+    buildCommand: pip install -r requirements.txt
     startCommand: python motiondetection.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.7
       - key: PORT
-        fromService: 
-          type: web
-          name: motion-detection
-          property: port
+        value: 10000
